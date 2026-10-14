@@ -1,0 +1,40 @@
+{
+  "retrieval": {
+    "window_days": 3,
+    "max_results_per_query": 80,
+    "max_papers": 5,
+    "arxiv_categories": ["cs.LG", "cs.AI", "cs.CL", "cs.MA", "cs.ML"],
+    "queries": [
+      "reinforcement learning large language model",
+      "RLHF large language model",
+      "LLM agent reinforcement learning",
+      "multi-agent large language model",
+      "multi-agent reinforcement learning LLM",
+      "agentic reinforcement learning reasoning"
+    ],
+    "venue_keywords": [
+      "NeurIPS", "ICML", "ICLR", "ACL", "EMNLP", "NAACL", "AAAI", "IJCAI",
+      "AAMAS", "COLM", "COLT", "UAI", "KDD", "WWW", "SIGIR",
+      "JMLR", "TPAMI", "TMLR", "TOIS", "Nature", "Science", "ICDE"
+    ],
+    "required_topics": {
+      "rl": ["reinforcement learning", "rlhf", "grpo", "ppo", "policy gradient",
+             "reward model", "reward learning", "q-learning", "temporal difference",
+             "trial-and-error", "markov decision"],
+      "llm": ["large language model", "language model", "llm", "llms", "gpt",
+              "instruction tuning", "alignment", "reasoning", "chain-of-thought",
+              "foundation model"],
+      "multi_agent": ["multi-agent", "multiagent", "multi agent", "agents",
+                      "collaborat", "cooperat", "debate", "society of minds",
+                      "agent collaboration", "collective"]
+    },
+    "top_venue_boost": true
+  },
+  "push": {
+    "identity": "user",
+    "target_user_id": "ou_9b2cff10601b4e6c8e43a12b6885622c",
+    "idempotency_prefix": "rl-daily-digest"
+  },
+  "python": "D:\\Miniforge3\\python.exe",
+  "project_root": "d:\\llm&rl"
+}
