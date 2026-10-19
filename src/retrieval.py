@@ -5,7 +5,8 @@ import json
 import re
 import time
 import urllib.parse
-import urllib.request
+
+import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
@@ -17,8 +18,8 @@ ATOM = "{http://www.w3.org/2005/Atom}"
 ARXIV_NS = "{http://arxiv.org/schemas/atom}"
 
 
-def _fetch_arxiv(query, max_results, retries=3):
-    """拉取 arXiv API，返回原始 XML 文本。"""
+def _fetch_arxiv(query, max_results, retries=4):
+    """拉取 arXiv API，返回原始 XML 文本。429 限流尊重 Retry-After，指数退避。"""
     url = (
         "http://export.arxiv.org/api/query?search_query="
         + urllib.parse.quote(query)
@@ -27,13 +28,18 @@ def _fetch_arxiv(query, max_results, retries=3):
     )
     for i in range(retries):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "rl-daily-digest/1.0"})
-            with urllib.request.urlopen(req, timeout=30) as r:
-                return r.read().decode("utf-8")
-        except Exception:
+            r = requests.get(url, headers={"User-Agent": "rl-daily-digest/1.0"}, timeout=45)
+            if r.status_code == 429:
+                wait = int(r.headers.get("Retry-After") or 10 * (i + 1))
+                print(f"[warn] arXiv 429 限流，{wait}s 后重试（第 {i + 1}/{retries} 次）")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.text
+        except requests.exceptions.RequestException:
             if i == retries - 1:
                 raise
-            time.sleep(3 * (i + 1))
+            time.sleep(10 * (i + 1))
 
 
 def _parse_entries(xml_text, cutoff):

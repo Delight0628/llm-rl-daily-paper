@@ -32,9 +32,26 @@
   },
   "push": {
     "identity": "user",
-    "target_user_id": "ou_9b2cff10601b4e6c8e43a12b6885622c",
+    "target_user_id": "ou_343c56c04da296433df5528f687f413d",
     "idempotency_prefix": "rl-daily-digest"
   },
-  "python": "D:\\Miniforge3\\python.exe",
-  "project_root": "d:\\llm&rl"
+  "video": {
+    "app_dir": "E:\\vibe-motion\\paper-digest",
+    "node": "C:\\Program Files\\nodejs\\node.exe",
+    "composition_id": "Motion30fps",
+    "width": 1080,
+    "height": 1920,
+    "brand_text": "RL × LLM × 多智能体 · 每日论文精读",
+    "figures_max": 3,
+    "tail_seconds": 1.4,
+    "render_scale": 0.667,
+    "crf": 28,
+    "tts": {
+      "engine": "edge-tts",
+      "voice": "zh-CN-XiaoxiaoNeural",
+      "rate": "+8%"
+    }
+  },
+  "python": "C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python311\\python.exe",
+  "project_root": "E:\\llm-rl-daily-paper"
 }

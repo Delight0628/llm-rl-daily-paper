@@ -48,5 +48,19 @@ def send_digest(md_text, date_str):
     return data["data"]
 
 
+def send_video(video_rel, cover_rel, date_str, suffix):
+    """推送单篇论文讲解视频（含封面图）到用户飞书。路径须为项目根目录相对路径。"""
+    key = f"{CFG['push']['idempotency_prefix']}-video-{date_str}-{suffix}"[:50]
+    data = _run([
+        "lark-cli", "im", "+messages-send",
+        "--user-id", CFG["push"]["target_user_id"],
+        "--as", CFG["push"]["identity"],
+        "--video", video_rel,
+        "--video-cover", cover_rel,
+        "--idempotency-key", key,
+    ], timeout=600)
+    return data["data"]
+
+
 if __name__ == "__main__":
     print(_run(["lark-cli", "whoami"]))
