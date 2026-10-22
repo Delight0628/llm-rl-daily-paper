@@ -24,17 +24,22 @@ import video
 STATE_FILE = os.path.join(ROOT, "state", "processed_ids.json")
 
 
+def _norm_id(aid):
+    """统一论文 ID：去掉 arXiv 版本后缀（v1/v2…），避免带/不带版本号导致去重失效。"""
+    return re.sub(r"v\d+$", "", (aid or "").strip())
+
+
 def load_processed():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding="utf-8") as f:
-            return set(json.load(f))
+            return {_norm_id(x) for x in json.load(f)}
     return set()
 
 
 def save_processed(ids):
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(ids), f, ensure_ascii=False, indent=2)
+        json.dump(sorted({_norm_id(x) for x in ids}), f, ensure_ascii=False, indent=2)
 
 
 def prepared_path(day):
@@ -66,7 +71,7 @@ def cmd_prepare():
     print(f"[1/3] 检索命中 {len(papers)} 篇候选")
 
     processed = load_processed()
-    new_papers = [p for p in papers if p["arxiv_id"] not in processed]
+    new_papers = [p for p in papers if _norm_id(p["arxiv_id"]) not in processed]
     print(f"[2/3] 去重后待解析 {len(new_papers)} 篇")
 
     reused = False
@@ -142,9 +147,9 @@ def _overview_markdown(day):
     return "\n".join(lines)
 
 
-def cmd_push(md_path, day=None):
+def cmd_push(md_path, day=None, tag=None):
     """阶段三：推送至飞书。有讲解视频则逐篇推视频 + 总览消息，
-    否则回退为图文 markdown 推送。"""
+    否则回退为图文 markdown 推送。tag 用于重发场景（区分幂等键）。"""
     day = day or date.today().isoformat()
     manifest = os.path.join(ROOT, "outputs", day, "videos.json")
     videos = []
@@ -153,15 +158,15 @@ def cmd_push(md_path, day=None):
             videos = json.load(f).get("videos", [])
 
     if videos:
-        res = push.send_digest(_overview_markdown(day), day)
+        res = push.send_digest(_overview_markdown(day), day, tag=tag)
         print(f"[push] 总览消息 message_id={res.get('message_id')}")
         for v in videos:
-            res = push.send_video(v["video"], v["cover"], day, v["arxiv_id"])
+            res = push.send_video(v["video"], v["cover"], day, v["arxiv_id"], tag=tag)
             print(f"[push] 视频已推送 {v['arxiv_id']} message_id={res.get('message_id')}")
     elif md_path:
         with open(md_path, encoding="utf-8") as f:
             md = f.read()
-        res = push.send_digest(md, day)
+        res = push.send_digest(md, day, tag=tag)
         print(f"[push] 已推送 message_id={res.get('message_id')}")
     else:
         print(f"[push] 无视频也无 digest markdown，跳过（{day}）", file=sys.stderr)
@@ -176,21 +181,132 @@ def cmd_push(md_path, day=None):
     return 0
 
 
+def cmd_portals(entry_type=0, keyword=""):
+    """列出萝卜图书馆（OpenCLI 站点）的下载/检索入口。"""
+    import luobo
+    rows = luobo.luobo_portals(entry_type, keyword)
+    print(f"== [portals] 萝卜图书馆入口 {len(rows)} 个 ==")
+    for r in rows:
+        print(f"  id={r['id']:<4} {r['name']:<16} type={r['type']:<3} {r['intro']}")
+    return 0
+
+
+def cmd_entry(entry_id=None, name=None):
+    """解析某个下载入口的真实地址。"""
+    import luobo
+    r = luobo.luobo_entry(entry_id, name)
+    print(f"[entry] {r['id']} {r['name']} -> {r['url']}  (via {r['via']})")
+    return 0
+
+
+def cmd_sub(day=None):
+    """给已出片视频补烧录口播字幕（只重建 props + ffmpeg 烧录，不重渲染画面）。"""
+    day = day or date.today().isoformat()
+    print(f"== [sub] 为 {day} 的视频烧录口播字幕 ==")
+    video.regenerate_props(day)
+    results = video.caption_video(day)
+    print(f"[sub] 完成 {len(results)} 条带字幕视频")
+    return 0
+
+
+def _mark_processed(day):
+    """把当日 prepared 的论文写入跨日去重记录。"""
+    processed = load_processed()
+    pp = prepared_path(day)
+    if os.path.exists(pp):
+        with open(pp, encoding="utf-8") as f:
+            processed |= {d["arxiv_id"] for d in json.load(f)["papers"]}
+        save_processed(processed)
+
+
+def cmd_daily(day=None):
+    """一键全链路：prepare → video（逐篇增量推送）→ 收尾。
+    逐篇推送：每渲染完一篇立即发出，不必等全部出片，避免长任务尾延迟导致漏推。"""
+    day = day or date.today().isoformat()
+    print(f"== [daily] 论文日报全链路 {day} ==")
+    rc = cmd_prepare()
+    if rc != 0:
+        print("[daily] prepare 失败，终止", file=sys.stderr)
+        return rc
+
+    overview_sent = False
+    pushed = set()
+
+    def deliver(item):
+        nonlocal overview_sent
+        arxiv_id = item["arxiv_id"]
+        if arxiv_id in pushed:
+            return
+        if not overview_sent:
+            res = push.send_digest(_overview_markdown(day), day)
+            print(f"[daily] 总览消息 message_id={res.get('message_id')}")
+            overview_sent = True
+        res = push.send_video(item["video"], item["cover"], day, arxiv_id)
+        pushed.add(arxiv_id)
+        print(f"[daily] 视频已推送 {arxiv_id} message_id={res.get('message_id')}")
+
+    try:
+        results = video.render_day(day, on_paper=deliver)
+    except Exception as ex:
+        print(f"[daily] 出片中断: {ex}", file=sys.stderr)
+        # 已渲染完成的成片仍尽量推送
+        manifest = os.path.join(ROOT, "outputs", day, "videos.json")
+        if os.path.exists(manifest):
+            with open(manifest, encoding="utf-8") as f:
+                for item in json.load(f).get("videos", []):
+                    deliver(item)
+        _mark_processed(day)
+        return 1
+
+    # 复用/跳过路径可能未触发回调，这里兜底补齐
+    for item in results:
+        deliver(item)
+
+    if not pushed:
+        print("[daily] 无任何视频可推送，终止", file=sys.stderr)
+        return 2
+
+    _mark_processed(day)
+    print(f"[daily] 全链路完成，共推送 {len(pushed)} 条视频")
+    return 0
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] == "prepare":
         return cmd_prepare()
+    if sys.argv[1] == "portals":
+        return cmd_portals(int(sys.argv[2]) if len(sys.argv) > 2 else 0)
+    if sys.argv[1] == "entry":
+        args = sys.argv[2:]
+        entry_id = args[0] if args and args[0].isdigit() else None
+        name = None
+        if "--name" in args:
+            name = args[args.index("--name") + 1]
+        elif entry_id is None and args:
+            name = args[0]
+        return cmd_entry(entry_id, name)
+    if sys.argv[1] == "sub":
+        return cmd_sub(sys.argv[2] if len(sys.argv) > 2 else None)
+    if sys.argv[1] == "daily":
+        args = [a for a in sys.argv[2:] if a != "--force"]
+        return cmd_daily(args[0] if args else None)
     if sys.argv[1] == "video":
         args = [a for a in sys.argv[2:] if a != "--force"]
         return cmd_video(args[0] if args else None, force="--force" in sys.argv[2:])
     if sys.argv[1] == "push":
-        args = sys.argv[2:]
+        raw = sys.argv[2:]
+        tag = None
+        if "--tag" in raw:
+            i = raw.index("--tag")
+            tag = raw[i + 1] if len(raw) > i + 1 else None
+            raw = raw[:i] + raw[i + 2:]
         md_path, day = None, None
-        if args and re.fullmatch(r"\d{4}-\d{2}-\d{2}", args[0]):
-            day = args[0]
-        elif args:
-            md_path = args[0]
-            day = args[1] if len(args) > 1 else None
-        return cmd_push(md_path, day)
+        if raw and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw[0]):
+            day = raw[0]
+        elif raw:
+            md_path = raw[0]
+            day = raw[1] if len(raw) > 1 else None
+        return cmd_push(md_path, day, tag=tag)
     print(f"unknown command: {sys.argv[1]}", file=sys.stderr)
     return 2
 

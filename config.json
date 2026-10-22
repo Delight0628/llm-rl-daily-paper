@@ -2,7 +2,7 @@
   "retrieval": {
     "window_days": 3,
     "max_results_per_query": 80,
-    "max_papers": 5,
+    "max_papers": 1,
     "arxiv_categories": ["cs.LG", "cs.AI", "cs.CL", "cs.MA", "cs.ML"],
     "queries": [
       "reinforcement learning large language model",
@@ -53,5 +53,15 @@
     }
   },
   "python": "C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python311\\python.exe",
-  "project_root": "E:\\llm-rl-daily-paper"
+  "project_root": "E:\\llm-rl-daily-paper",
+  "opencli": {
+    "enabled": true,
+    "js": "E:\\OpenCLI\\dist\\src\\main.js",
+    "global_dir": "E:\\rea\\npm-global",
+    "timeout": 120
+  },
+  "luobo": {
+    "username": "72114569837313",
+    "password": "73475557"
+  }
 }

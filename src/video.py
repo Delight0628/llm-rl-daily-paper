@@ -46,6 +46,7 @@ TAIL_SECONDS = float(VCFG.get("tail_seconds", 1.4))
 MAX_SEGMENT_SECONDS = 60.0                   # 讲透为准，单段最长 60s
 RENDER_SCALE = VCFG.get("render_scale", 0.667)  # 输出缩放（0.667 → 720x1280，控制飞书上传体积）
 CRF = int(VCFG.get("crf", 28))                  # H.264 质量系数，越小越清晰
+CONCURRENCY = int(VCFG.get("concurrency", 2))   # 渲染并发：长视频并发过高会导致 Chrome 内存溢出
 PYTHON = CFG.get("python", "python")
 
 OUTRO_LINES = [
@@ -63,8 +64,7 @@ TERM_BAN_RE = re.compile(
 )
 
 STAT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(个百分点|分|%|％|倍|万|亿)")
-FIG_BLOCK_RE = re.compile(r"<figure[^>]*>(.*?)</figure>", re.S)
-IMG_TAG_RE = re.compile(r'<img[^>]+src="([^"]+)"[^>]*>')
+GRAPHIC_RE = re.compile(r'<(?:img|object)\b[^>]*?(?:src|data)="([^"]+)"[^>]*>', re.I | re.S)
 CAPTION_RE = re.compile(r"<figcaption[^>]*>(.*?)</figcaption>", re.S)
 FIGSIZE_RE = re.compile(r'width="(\d+)"[^>]*height="(\d+)"')
 TAG_RE = re.compile(r"<[^>]+>")
@@ -152,6 +152,21 @@ def synth_narration(text, out_base):
 
 # ---------------- 论文原图抓取（按图注优选框架图） ----------------
 
+def _svg_to_png(svg_path, png_path, scale=2.5):
+    """把 SVG 原图渲染成 PNG（pymupdf），失败返回 False。"""
+    try:
+        import fitz
+        with open(svg_path, "rb") as f:
+            data = f.read()
+        doc = fitz.open(stream=data, filetype="svg")
+        pix = doc[0].get_pixmap(matrix=fitz.Matrix(scale, scale))
+        doc.close()
+        pix.save(png_path)
+        return os.path.exists(png_path) and os.path.getsize(png_path) > 5000
+    except Exception:
+        return False
+
+
 def fetch_figures(arxiv_id, figs_dir, max_count=None):
     """抓取 arXiv HTML 版论文原图，按图注关键词优选创新框架图/技术原理图。
     返回 [{"path", "caption", "source"}]，并写 meta.json 缓存。"""
@@ -177,16 +192,22 @@ def fetch_figures(arxiv_id, figs_dir, max_count=None):
         return []
 
     cands = []
-    for block in FIG_BLOCK_RE.findall(html):
-        im = IMG_TAG_RE.search(block)
-        if not im:
+    for m in CAPTION_RE.finditer(html):
+        cap_text = TAG_RE.sub(" ", m.group(1))
+        cap_text = re.sub(r"\s+", " ", cap_text).strip()
+        if not cap_text or cap_text.lower().startswith("table"):
             continue
+        # 图形资源位于图注之前：取最近一个（兼容 <img>/<object> 与嵌套子图结构）
+        seg = html[max(0, m.start() - 4000):m.start()]
+        graphics = [g for g in GRAPHIC_RE.finditer(seg)
+                    if not g.group(1).startswith("data:")]
+        if not graphics:
+            continue
+        im = graphics[-1]
         src = im.group(1)
-        if "/static/" in src or "logo" in src or src.endswith(".svg"):
+        if "/static/" in src or "logo" in src:
             continue
-        cap_m = CAPTION_RE.search(block)
-        cap_text = TAG_RE.sub(" ", cap_m.group(1)) if cap_m else ""
-        cap_text = re.sub(r"\s+", " ", cap_text).strip()[:110]
+        cap_show = cap_text[:110]
         sz = FIGSIZE_RE.search(im.group(0))
         area = int(sz.group(1)) * int(sz.group(2)) if sz else 0
         low = cap_text.lower()
@@ -199,21 +220,49 @@ def fetch_figures(arxiv_id, figs_dir, max_count=None):
         score += 3.0 if fig_num == 1 else (1.5 if fig_num == 2 else 0.0)
         if cap_text:
             score += 1.5
-        cands.append({"score": score, "url": urljoin(page, src), "caption": cap_text})
+        cands.append({"score": score, "url": urljoin(page, src), "caption": cap_show})
     cands.sort(key=lambda d: -d["score"])
 
     out = []
-    for i, cand in enumerate(cands[:max_count]):
+    seen_srcs = set()
+    for cand in cands:
+        if len(out) >= max_count:
+            break
+        if cand["url"] in seen_srcs:
+            continue
+        seen_srcs.add(cand["url"])
         ext = os.path.splitext(cand["url"])[1].split("?")[0] or ".png"
-        dst = os.path.join(figs_dir, f"fig{i + 1}{ext}")
+        dst = os.path.join(figs_dir, f"fig{len(out) + 1}{ext}")
         p = subprocess.run(
             ["curl.exe", "-sL", "--retry", "2", "--max-time", "60",
              "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", cand["url"], "-o", dst],
             capture_output=True, timeout=120)
-        if p.returncode == 0 and os.path.exists(dst) and os.path.getsize(dst) > 5000:
-            out.append({"path": dst,
-                        "caption": cand["caption"] or f"论文原图 {i + 1}",
-                        "source": "图源 · arXiv 原文（创新框架/技术原理图）"})
+        if p.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) < 5000:
+            continue
+        if ext.lower() == ".svg":
+            # arXiv HTML 版部分原图为 SVG（<object> 标记），渲染成 PNG 供视频使用
+            png = os.path.splitext(dst)[0] + ".png"
+            if not _svg_to_png(dst, png):
+                continue
+            os.remove(dst)
+            dst = png
+        out.append({"path": dst,
+                    "caption": cand["caption"] or f"论文原图 {len(out) + 1}",
+                    "source": "图源 · arXiv 原文（创新框架/技术原理图）"})
+
+    if not out:
+        # arXiv HTML 不可用时，从论文 PDF 提取嵌入图（框架图/原理图）
+        try:
+            import pdf_figs
+            pdf_out = pdf_figs.figures_from_arxiv_pdf(arxiv_id, figs_dir, max_count=max_count)
+            for p in pdf_out:
+                out.append({"path": p,
+                            "caption": "论文原图 · PDF 嵌入图",
+                            "source": "图源 · 论文 PDF 提取"})
+            if out:
+                print(f"    [fig] HTML 版不可用，已从 PDF 提取 {len(out)} 张原图")
+        except Exception as ex:
+            print(f"    [warn] PDF 提图失败: {ex}")
     return out
 
 
@@ -278,6 +327,114 @@ def _bullet_narration(heading, bullets, items=None):
     for it in items or []:
         parts.append(f"{it.get('term', '')}，{it.get('explain', '')}")
     return _join_narration(*parts)
+
+
+CAPTION_STRONG_RE = re.compile(r"(?<=[。！？!?；;])")
+CAPTION_SOFT_RE = re.compile(r"(?<=[，、,：:])")
+CAPTION_MAX_LEN = 20
+
+
+def _visual_len(text):
+    """视觉宽度：中文按 1 计，ASCII 按 0.55 计。"""
+    n = 0.0
+    for ch in text:
+        n += 0.55 if ord(ch) < 128 else 1.0
+    return n
+
+
+def _hard_cut(text, max_len):
+    """按视觉宽度硬切一段（用于没有标点的超长句）。"""
+    out, acc = "", 0.0
+    for ch in text:
+        w = 0.55 if ord(ch) < 128 else 1.0
+        if acc + w > max_len and out:
+            break
+        out += ch
+        acc += w
+    return out or text[:1]
+
+
+def _split_caption_lines(text, max_len=CAPTION_MAX_LEN):
+    """把口播文本切成适合竖屏阅读的短句：优先句号，其次逗号，最后硬切。"""
+    text = re.sub(r"[ \t\r\n]+", " ", (text or "").strip())
+    if not text:
+        return []
+    lines = []
+    for part in (p.strip() for p in CAPTION_STRONG_RE.split(text)):
+        if not part:
+            continue
+        if _visual_len(part) <= max_len:
+            lines.append(part)
+            continue
+        buf = ""
+        for sub in (s.strip() for s in CAPTION_SOFT_RE.split(part)):
+            if not sub:
+                continue
+            while _visual_len(sub) > max_len:
+                if buf:
+                    lines.append(buf)
+                    buf = ""
+                cut = _hard_cut(sub, max_len)
+                lines.append(cut)
+                sub = sub[len(cut):]
+            if _visual_len(buf + sub) <= max_len:
+                buf += sub
+            else:
+                if buf:
+                    lines.append(buf)
+                buf = sub
+        if buf:
+            lines.append(buf)
+    return [l for l in lines if l]
+
+
+def build_captions(text, duration):
+    """按音频时长生成字幕条：字符权重分配时间，短句不闪烁。"""
+    lines = _split_caption_lines(text)
+    if not lines or duration <= 0:
+        return []
+    weights = [max(1.0, _visual_len(l)) for l in lines]
+    total = sum(weights)
+    span = max(0.8, float(duration))
+    # 单句最短 0.9s：若按权重分配过短，则合并相邻短句
+    merged, buf, buf_w = [], None, 0.0
+    for line, w in zip(lines, weights):
+        d = span * w / total
+        if buf is not None and d < 0.9 and buf_w + d < span * 0.45:
+            buf = f"{buf}{line}"
+            buf_w += d
+            continue
+        if buf is not None:
+            merged.append((buf, buf_w))
+        buf, buf_w = line, d
+    if buf is not None:
+        merged.append((buf, buf_w))
+    if not merged:
+        return []
+
+    total_w = sum(w for _, w in merged) or 1.0
+    cues, t = [], 0.0
+    for line, w in merged:
+        d = span * w / total_w
+        cues.append({"start": round(t, 2), "end": round(t + d, 2), "text": line})
+        t += d
+    if cues:
+        cues[-1]["end"] = round(span, 2)
+    return cues
+
+
+def _clean_venue(raw):
+    """清洗 venue 展示文本：comments 里的 URL/页数说明不适合当出版源展示。"""
+    v = (raw or "").strip()
+    if not v:
+        return "arXiv 预印本"
+    if re.search(r"https?://|project page|\bcode\b|github", v, re.I):
+        # 论文 comments 里的链接说明，提取不到真实出版源时统一标注
+        return "arXiv 预印本"
+    if re.search(r"\d+\s*pages?|\d+\s*figures?|\d+\s*tables?", v, re.I):
+        return "arXiv 预印本"
+    v = re.sub(r"\s+", " ", v).strip(" ;,，。")
+    return v[:26] if len(v) > 26 else v
 
 
 def _filter_terms(items):
@@ -414,6 +571,165 @@ def _run_node(args, timeout=1800):
     return p
 
 
+ASS_HEADER = """[Script Info]
+ScriptType: v4.00+
+PlayResX: {w}
+PlayResY: {h}
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Cap,Microsoft YaHei,{fs},&H00FFFFFF,&H00FFFFFF,&H4D020B1A,&H4D020B1A,0,0,0,0,100,100,0,0,3,{pad},0,2,44,44,{mv},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+
+def _ass_time(seconds):
+    """ASS 时间格式 H:MM:SS.cc"""
+    seconds = max(0.0, float(seconds))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    return f"{h}:{m:02d}:{s:05.2f}"
+
+
+def build_ass(props, ass_path, width=720, height=1280):
+    """从 props 生成整片 ASS 字幕：分镜内时间 + 分镜起始偏移。返回字幕条数。"""
+    fs = 26 if width <= 720 else 36
+    pad = 10 if width <= 720 else 14
+    mv = 58 if width <= 720 else 84
+    lines = [ASS_HEADER.format(w=width, h=height, fs=fs, pad=pad, mv=mv)]
+    offset = 0.0
+    count = 0
+    for seg in props.get("segments", []):
+        for cue in seg.get("captions") or []:
+            start = offset + float(cue.get("start", 0))
+            end = offset + float(cue.get("end", 0))
+            text = str(cue.get("text", "")).replace("\n", "\\N").strip()
+            if not text or end <= start:
+                continue
+            lines.append(
+                f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Cap,,0,0,0,,{text}")
+            count += 1
+        offset += float(seg.get("durationSeconds") or 0)
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return count
+
+
+def burn_captions(video_abs, ass_path, out_abs=None):
+    """用 ffmpeg/libass 把 ASS 字幕烧录进已有视频（画面不重渲染，规避内存瓶颈）。"""
+    try:
+        import imageio_ffmpeg
+        ff = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        raise RuntimeError(f"未安装 imageio-ffmpeg，无法烧录字幕: {exc}")
+    out_abs = out_abs or (video_abs + ".sub.mp4")
+    work_dir = os.path.dirname(video_abs)
+    p = subprocess.run(
+        [ff, "-y", "-i", os.path.basename(video_abs),
+         "-vf", f"ass={os.path.basename(ass_path)}",
+         "-c:v", "libx264", "-crf", "23", "-preset", "veryfast",
+         "-c:a", "copy", os.path.basename(out_abs)],
+        cwd=work_dir, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=3600)
+    if p.returncode != 0 or not os.path.exists(out_abs):
+        raise RuntimeError(f"字幕烧录失败: {(p.stderr or '')[-400:]}")
+    return out_abs
+
+
+def regenerate_props(day):
+    """仅重建某日全部分镜 props（含字幕时间轴），不渲染视频。"""
+    prepared_path = os.path.join(ROOT, "state", f"prepared_{day}.json")
+    with open(prepared_path, encoding="utf-8") as f:
+        prepared = json.load(f)
+    out_dir = os.path.join(ROOT, "outputs", day)
+    scripts_dir = os.path.join(out_dir, "scripts")
+    results = []
+    for draft in prepared.get("papers", []):
+        script = None
+        script_path = _find_in_outputs(day, "scripts", f"{draft['arxiv_id']}.json")
+        if script_path:
+            with open(script_path, encoding="utf-8") as f:
+                script = json.load(f)
+        print(f"  [props] {draft['arxiv_id']}")
+        results.append(render_paper(draft, out_dir, script, day, props_only=True))
+    return results
+
+
+def caption_video(day, width=720, height=1280):
+    """给某日已出片视频补烧录口播字幕，返回处理结果列表。"""
+    manifest = os.path.join(ROOT, "outputs", day, "videos.json")
+    with open(manifest, encoding="utf-8") as f:
+        videos = json.load(f).get("videos", [])
+    out = []
+    for v in videos:
+        video_abs = os.path.join(ROOT, v["video"])
+        props_path = os.path.join(ROOT, "outputs", day, f"{v['arxiv_id']}.video.json")
+        if not (os.path.exists(video_abs) and os.path.exists(props_path)):
+            print(f"  [skip] 缺少视频或 props: {v['arxiv_id']}")
+            continue
+        with open(props_path, encoding="utf-8") as f:
+            props = json.load(f)
+        if not any(seg.get("captions") for seg in props.get("segments", [])):
+            print(f"  [warn] {v['arxiv_id']} props 无字幕数据（需先重跑 video 阶段生成字幕时间轴）")
+            continue
+        ass_path = os.path.join(ROOT, "outputs", day, f"{v['arxiv_id']}.ass")
+        n = build_ass(props, ass_path, width=width, height=height)
+        print(f"  [sub] {v['arxiv_id']} 字幕 {n} 条，烧录中 ...")
+        tmp = burn_captions(video_abs, ass_path)
+        os.replace(tmp, video_abs)
+        ensure_push_size(video_abs)
+        out.append({"arxiv_id": v["arxiv_id"], "captions": n,
+                    "size_mb": round(os.path.getsize(video_abs) / 1024 / 1024, 1)})
+        print(f"  [sub] {v['arxiv_id']} 完成 {out[-1]['size_mb']}MB")
+    return out
+
+
+def _available_memory_gb():
+    """返回 (可用物理内存GB, 可用提交内存GB)，用于渲染前判断并发。"""
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        st = MEMORYSTATUSEX()
+        st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return 0.0, 0.0
+        return st.ullAvailPhys / 1024 ** 3, st.ullAvailPageFile / 1024 ** 3
+    except Exception:
+        return 0.0, 0.0
+
+
+def pick_concurrency():
+    """按当前可用内存选择渲染并发：内存紧张时降到 1，避免 Chrome 渲染 OOM。"""
+    avail_phys, avail_commit = _available_memory_gb()
+    if avail_phys <= 0:
+        return CONCURRENCY
+    if avail_phys < 1.2 or avail_commit < 1.5:
+        return 1
+    if avail_phys < 2.5:
+        return min(CONCURRENCY, 2)
+    if avail_phys < 4.0:
+        return min(CONCURRENCY, 3)
+    return CONCURRENCY
+
+
 def ensure_push_size(video_abs, max_mb=18):
     """超出飞书上传上限时用 ffmpeg 二次压缩（未来出片自动适配）。"""
     if os.path.getsize(video_abs) <= max_mb * 1024 * 1024:
@@ -440,8 +756,9 @@ def ensure_push_size(video_abs, max_mb=18):
         os.remove(tmp)
 
 
-def render_paper(draft, out_dir, script=None, day=None):
-    """渲染单篇论文讲解视频 + 封面图（含配音与图叙事），返回产物相对路径。"""
+def render_paper(draft, out_dir, script=None, day=None, props_only=False):
+    """渲染单篇论文讲解视频 + 封面图（含配音与图叙事），返回产物相对路径。
+    props_only=True 时只生成 props（含字幕时间轴），不渲染视频。"""
     arxiv_id = draft["arxiv_id"]
     os.makedirs(out_dir, exist_ok=True)
     day = day or os.path.basename(out_dir)
@@ -468,13 +785,17 @@ def render_paper(draft, out_dir, script=None, day=None):
         if audio_path:
             seg["audio"] = os.path.basename(audio_path)
             seg["audioSeconds"] = round(dur, 2)
-            seg["durationSeconds"] = round(
-                min(max(dur + TAIL_SECONDS, 4.0), MAX_SEGMENT_SECONDS), 2)
+            seg_dur = round(min(max(dur + TAIL_SECONDS, 4.0), MAX_SEGMENT_SECONDS), 2)
+            seg["durationSeconds"] = seg_dur
+            # 字幕时间轴不得超过分镜时长（超长语音被截断时避免字幕串段）
+            seg["captions"] = build_captions(text, min(dur, seg_dur))
         else:
             seg["audio"] = None
             seg.pop("audioSeconds", None)
             seg["durationSeconds"] = 0  # 由时间轴启发式兜底
-        print(f"    [tts] seg{i + 1} {seg['kind']} {seg['durationSeconds']}s")
+            seg["captions"] = []
+        print(f"    [tts] seg{i + 1} {seg['kind']} {seg['durationSeconds']}s "
+              f"字幕 {len(seg.get('captions', []))} 条")
 
     # 3. 资源注入 public/（Remotion staticFile 引用）
     asset_dir = os.path.join(APP_DIR, "public", "assets", arxiv_id)
@@ -500,7 +821,7 @@ def render_paper(draft, out_dir, script=None, day=None):
             "title": draft["title"],
             "titleZh": (script or {}).get("title_zh") or draft.get("title_zh") or "",
             "arxivId": arxiv_id,
-            "venue": draft.get("venue", "arXiv 预印本"),
+            "venue": _clean_venue(draft.get("venue", "")),
             "published": draft.get("published", ""),
             "authors": draft.get("authors", ""),
             "score": draft.get("score", 0),
@@ -515,10 +836,31 @@ def render_paper(draft, out_dir, script=None, day=None):
     video_abs = os.path.join(out_dir, f"{arxiv_id}.mp4")
     cover_abs = os.path.join(out_dir, f"{arxiv_id}_cover.png")
 
-    _run_node(["scripts/remotion-cli.mjs", "render", COMPOSITION_ID, video_abs,
-               "--codec=h264", "--pixel-format=yuv420p", "--image-format=jpeg",
-               f"--scale={RENDER_SCALE}", f"--crf={CRF}",
-               f"--props={props_path}"])
+    if props_only:
+        rel = lambda p: os.path.relpath(p, ROOT).replace("\\", "/")
+        return {"arxiv_id": arxiv_id, "title": draft["title"],
+                "video": rel(video_abs), "cover": rel(cover_abs)}
+
+    conc = pick_concurrency()
+    avail_phys, avail_commit = _available_memory_gb()
+    print(f"    [render] 可用内存 {avail_phys:.1f}GB / 提交余量 {avail_commit:.1f}GB → 并发 {conc}")
+
+    def _render(c):
+        # 长视频 + 低内存并发 1 时渲染可能超过 30 分钟，放宽到 90 分钟
+        _run_node(["scripts/remotion-cli.mjs", "render", COMPOSITION_ID, video_abs,
+                   "--codec=h264", "--pixel-format=yuv420p", "--image-format=jpeg",
+                   f"--scale={RENDER_SCALE}", f"--crf={CRF}",
+                   f"--concurrency={c}",
+                   f"--props={props_path}"], timeout=5400)
+
+    try:
+        _render(conc)
+    except RuntimeError as exc:
+        if conc > 1 and "ran out of memory" in str(exc).lower():
+            print("    [render] Chrome 内存不足，降为并发 1 重试")
+            _render(1)
+        else:
+            raise
     _run_node(["scripts/remotion-cli.mjs", "still", COMPOSITION_ID, cover_abs,
                "--frame=240", f"--props={props_path}"])
     ensure_push_size(video_abs)
@@ -548,9 +890,10 @@ def _find_in_outputs(day, *parts):
     return None
 
 
-def render_day(day, force=False):
+def render_day(day, force=False, on_paper=None):
     """渲染某日全部论文视频，写清单 outputs/<day>/videos.json。
-    已有脚本/视频/封面跨日复用（复用日零渲染成本）。"""
+    已有脚本/视频/封面跨日复用（复用日零渲染成本）。
+    on_paper: 每完成一篇的回调（用于增量推送，避免等全部渲染完）。"""
     prepared_path = os.path.join(ROOT, "state", f"prepared_{day}.json")
     with open(prepared_path, encoding="utf-8") as f:
         prepared = json.load(f)
@@ -565,8 +908,11 @@ def render_day(day, force=False):
         cover_abs = _find_in_outputs(day, f"{arxiv_id}_cover.png")
         if not force and video_abs and cover_abs:
             print(f"  [skip] 复用已产出视频 {arxiv_id} ({rel(video_abs)})")
-            results.append({"arxiv_id": arxiv_id, "title": draft["title"],
-                            "video": rel(video_abs), "cover": rel(cover_abs)})
+            item = {"arxiv_id": arxiv_id, "title": draft["title"],
+                    "video": rel(video_abs), "cover": rel(cover_abs)}
+            results.append(item)
+            if on_paper:
+                on_paper(item)
             continue
 
         script = None
@@ -575,9 +921,14 @@ def render_day(day, force=False):
             with open(script_path, encoding="utf-8") as f:
                 script = json.load(f)
             print(f"  [reuse] 复用讲解脚本 {rel(script_path)}")
+        else:
+            print(f"  [warn] {arxiv_id} 无中文讲解脚本，使用摘要草稿自动分镜（配音为英文摘要，可读性下降）")
 
         print(f"  [render] {arxiv_id} {draft['title'][:40]}...")
-        results.append(render_paper(draft, out_dir, script, day))
+        item = render_paper(draft, out_dir, script, day)
+        results.append(item)
+        if on_paper:
+            on_paper(item)
 
     manifest = {"date": day, "videos": results}
     manifest_path = os.path.join(out_dir, "videos.json")

@@ -33,11 +33,15 @@ def upload_image(rel_path):
     return data["data"]["image_key"]
 
 
-def send_digest(md_text, date_str):
-    """推送日报 markdown 文本（内含 img_ 引用）到用户飞书。"""
+def send_digest(md_text, date_str, tag=None):
+    """推送日报 markdown 文本（内含 img_ 引用）到用户飞书。
+    tag 用于重发场景区分幂等键（如字幕版重发）。"""
     import hashlib
     digest = hashlib.md5(md_text.encode("utf-8")).hexdigest()[:10]
-    key = f"{CFG['push']['idempotency_prefix']}-{date_str}-{digest}"[:50]
+    key = f"{CFG['push']['idempotency_prefix']}-{date_str}-{digest}"
+    if tag:
+        key += f"-{tag}"
+    key = key[:50]
     data = _run([
         "lark-cli", "im", "+messages-send",
         "--user-id", CFG["push"]["target_user_id"],
@@ -48,9 +52,12 @@ def send_digest(md_text, date_str):
     return data["data"]
 
 
-def send_video(video_rel, cover_rel, date_str, suffix):
+def send_video(video_rel, cover_rel, date_str, suffix, tag=None):
     """推送单篇论文讲解视频（含封面图）到用户飞书。路径须为项目根目录相对路径。"""
-    key = f"{CFG['push']['idempotency_prefix']}-video-{date_str}-{suffix}"[:50]
+    key = f"{CFG['push']['idempotency_prefix']}-video-{date_str}-{suffix}"
+    if tag:
+        key += f"-{tag}"
+    key = key[:50]
     data = _run([
         "lark-cli", "im", "+messages-send",
         "--user-id", CFG["push"]["target_user_id"],
